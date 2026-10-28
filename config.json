@@ -1,0 +1,49 @@
+{
+  "data_file": "data/flood_features.xlsx",
+  "topology_file": "data/topology.csv",
+  "station_file": "data/stations.csv",
+  "event_file": "data/events.csv",
+  "hidden_dim": 32,
+  "graph_embed_dim": 8,
+  "epochs": 300,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0,
+  "cont_loss_weight": 1.0,
+  "flag_loss_weight": 1.0,
+  "std_floor": 1e-06,
+  "validation_last_n": 2,
+  "normalization_events": "all_42_events",
+  "normalization_valid_nodes": "selected feature vector not all zero",
+  "shuffle_training_events": false,
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "silhouette_k_min": 2,
+  "silhouette_k_max": 10,
+  "subset_sizes": [
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "selected_features": [
+    "total_volume",
+    "max_volume_12h",
+    "max_volume_24h",
+    "max_volume_48h",
+    "recession_v"
+  ]
+}
