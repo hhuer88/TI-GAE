@@ -31,6 +31,25 @@ def choose_k_by_silhouette(X: np.ndarray, k_min: int=2, k_max: int=None, random_
         best_k = 2
     return (best_k, scores)
 
+def prepare_subset_data(raw: np.ndarray, indices: List[int], std_floor: float):
+    """Historical per-station normalization, with statistics for checkpointing."""
+    raw_combo = raw[:, :, indices].astype(np.float32)
+    node_zero_mask = np.all(raw_combo == 0.0, axis=-1)
+    flood_flag = (~node_zero_mask).astype(np.float32)[..., None]
+    valid = (~node_zero_mask).astype(np.float64)[..., None]
+    raw64 = raw_combo.astype(np.float64)
+    count = valid.sum(axis=0)
+    denominator = np.maximum(count, 1.0)
+    mean = (raw64 * valid).sum(axis=0) / denominator
+    difference = raw64 - mean[None, :, :]
+    variance = ((difference * valid) ** 2).sum(axis=0) / denominator
+    std = np.sqrt(variance)
+    std = np.where((~np.isfinite(std)) | (std < std_floor), 1.0, std)
+    normalized = ((raw64 - mean[None, :, :]) / (std[None, :, :] + 1e-8)).astype(np.float32)
+    inputs = np.concatenate([normalized, flood_flag], axis=-1).astype(np.float32)
+    return inputs, normalized.astype(np.float32), flood_flag.astype(np.float32), mean, std
+
+
 class DirectedGraphAE(nn.Module):
     """
     连续特征：回归重建（MSE），训练时只在 flood_flag=1 的节点上计算 MSE；

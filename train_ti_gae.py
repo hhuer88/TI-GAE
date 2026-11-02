@@ -1,7 +1,8 @@
 """Portable entry point for TI-GAE training and indicator-subset searches."""
 import os
-for key in ['OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS']:
-    os.environ.setdefault(key,'1')
+for key in ['OMP_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS',
+            'OPENBLAS_NUM_THREADS','VECLIB_MAXIMUM_THREADS','BLIS_NUM_THREADS']:
+    os.environ[key]='1'
 from pathlib import Path
 import argparse
 import itertools
@@ -10,7 +11,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
-from ti_gae_core import DirectedGraphAE, masked_mse_on_flag, choose_k_by_silhouette
+from ti_gae_core import DirectedGraphAE, masked_mse_on_flag, choose_k_by_silhouette, prepare_subset_data
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
@@ -25,14 +26,16 @@ def load_inputs(config):
     if len(features)!=15 or len(stations)!=11:
         raise ValueError('Expected 15 indicators and 11 stations.')
     arrays=[]
+    # Read indicators in their stored units; normalization is applied separately.
     for name,frame in sheets.items():
         if frame.sheet_name.tolist()!=stations['name'].tolist():
             raise ValueError(f'Station order mismatch in worksheet {name}.')
-        values=frame[features].apply(pd.to_numeric,errors='raise').to_numpy(np.float32)
+        numeric=frame[features].apply(pd.to_numeric,errors='raise')
+        values=numeric.to_numpy(np.float32)
         if not np.isfinite(values).all():
             raise ValueError(f'Non-finite indicators in worksheet {name}.')
         arrays.append(values)
-    raw=np.stack(arrays)
+    raw=np.ascontiguousarray(np.stack(arrays))
     edges=pd.read_csv(ROOT/config['topology_file'])
     if edges.shape!=(10,2) or not ((edges.to_numpy()>=0)&(edges.to_numpy()<11)).all():
         raise ValueError('Expected ten directed upstream-to-downstream edges.')
@@ -43,17 +46,7 @@ def load_inputs(config):
     return raw,features,list(sheets),edge_index,events
 
 def prepare_subset(raw,indices,std_floor):
-    # The retained study inputs use per-station statistics over all 42 events.
-    values=raw[:,:,indices].astype(np.float64)
-    flags=np.any(values!=0,axis=-1).astype(np.float64)[...,None]
-    denominator=np.maximum(flags.sum(axis=0),1.0)
-    means=(values*flags).sum(axis=0)/denominator
-    stds=np.sqrt((((values-means)*flags)**2).sum(axis=0)/denominator)
-    stds=np.where((~np.isfinite(stds))|(stds<std_floor),1.0,stds)
-    target=((values-means)/(stds+1e-8)).astype(np.float32)
-    flag=flags.astype(np.float32)
-    inputs=np.concatenate([target,flag],axis=-1)
-    return inputs,target,flag,means,stds
+    return prepare_subset_data(raw,indices,std_floor)
 
 def train_subset(raw,all_features,sheets,edges,events,features,seed,config,output,device,epochs):
     if output.exists():
@@ -62,7 +55,7 @@ def train_subset(raw,all_features,sheets,edges,events,features,seed,config,outpu
     if torch.cuda.is_available():torch.cuda.manual_seed_all(seed)
     indices=[all_features.index(f) for f in features]
     inputs,target,flags,means,stds=prepare_subset(raw,indices,config['std_floor'])
-    x=torch.tensor(inputs,device=device);y=torch.tensor(target,device=device);flag=torch.tensor(flags,device=device)
+    x=torch.from_numpy(inputs).to(device);y=torch.from_numpy(target).to(device);flag=torch.from_numpy(flags).to(device)
     edge=edges.to(device)
     model=DirectedGraphAE(len(features)+1,len(features),config['hidden_dim'],config['graph_embed_dim']).to(device)
     optimizer=torch.optim.Adam(model.parameters(),lr=config['learning_rate'],weight_decay=config['weight_decay'])
@@ -76,16 +69,23 @@ def train_subset(raw,all_features,sheets,edges,events,features,seed,config,outpu
         loss=config['cont_loss_weight']*mse+config['flag_loss_weight']*binary
         return loss,mse,binary
     for epoch in range(1,epochs+1):
-        model.train();train_loss=[]
+        model.train();train_loss=[0.0,0.0,0.0]
         order=np.random.permutation(train_indices) if config['shuffle_training_events'] else train_indices
         for index in order:
             optimizer.zero_grad(set_to_none=True)
-            loss,mse,binary=loss_for(int(index));loss.backward();optimizer.step()
-            train_loss.append([loss.item(),mse.item(),binary.item()])
+            loss,mse,binary=loss_for(int(index));loss.backward()
+            if config.get('grad_clip',0.0)>0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(),config['grad_clip'])
+            optimizer.step()
+            train_loss[0]+=float(loss.item());train_loss[1]+=float(mse.item());train_loss[2]+=float(binary.item())
         model.eval()
-        with torch.no_grad():val_loss=[[v.item() for v in loss_for(int(i))] for i in val_indices]
-        history.append([epoch,*np.mean(train_loss,axis=0),*np.mean(val_loss,axis=0)])
-    with torch.no_grad():embeddings=np.stack([model.encode(v,edge)[0].cpu().numpy() for v in x])
+        val_loss=[0.0,0.0,0.0]
+        with torch.inference_mode():
+            for index in val_indices:
+                loss,mse,binary=loss_for(int(index))
+                val_loss[0]+=float(loss.item());val_loss[1]+=float(mse.item());val_loss[2]+=float(binary.item())
+        history.append([epoch,*[value/len(train_indices) for value in train_loss],*[value/len(val_indices) for value in val_loss]])
+    with torch.inference_mode():embeddings=np.array([model.encode(v,edge).squeeze(0).detach().cpu().numpy() for v in x])
     best_k,scores=choose_k_by_silhouette(embeddings,config['silhouette_k_min'],config['silhouette_k_max'],seed)
     labels=KMeans(n_clusters=best_k,n_init=10,random_state=seed).fit_predict(embeddings)
     score=float(silhouette_score(embeddings,labels))
@@ -95,7 +95,7 @@ def train_subset(raw,all_features,sheets,edges,events,features,seed,config,outpu
     frame.insert(0,'event_id',events.event_id);frame.insert(0,'event_index',events.event_index);frame['cluster']=labels
     frame.to_csv(output/'embeddings_and_clusters.csv',index=False)
     pd.DataFrame(sorted(scores.items()),columns=['k','silhouette_score']).to_csv(output/'silhouette_scores.csv',index=False)
-    torch.save({'model_state_dict':model.state_dict(),'config':config,'seed':seed,'feature_names':features,'train_idx':train_indices.tolist(),'val_idx':val_indices.tolist(),'normalization_mean':means,'normalization_std':stds},output/'model.pt')
+    torch.save({'model_state_dict':model.state_dict(),'config':config,'seed':seed,'feature_names':features,'train_idx':train_indices.tolist(),'val_idx':val_indices.tolist(),'normalization_mean':torch.from_numpy(means),'normalization_std':torch.from_numpy(stds),'normalization_volume_unit':config.get('volume_unit','million_m3')},output/'model.pt')
     summary={'seed':seed,'features':features,'epochs':epochs,'best_k':best_k,'silhouette_score':score,'train_events':len(train_indices),'validation_events':len(val_indices)}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(summary),flush=True)
@@ -113,6 +113,8 @@ def main():
     parser.add_argument('--start',type=int,default=0,help='Zero-based subset offset for a divided search.')
     parser.add_argument('--limit',type=int,help='Maximum number of subsets for this invocation.')
     args=parser.parse_args()
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
     config=json.loads(args.config.read_text(encoding='utf-8'))
     raw,features,sheets,edge,events=load_inputs(config)
     if args.check_inputs:
